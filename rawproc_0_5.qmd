@@ -1,0 +1,378 @@
+---
+title: "AAVSO Solar Raw Processing"
+subtitle: "Port of RAWPROC_DB.PL v1.0 — Matthew Templeton, AAVSO HQ (2012-06-13)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    self-contained: true
+  pdf:
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+params:
+  month: 3        # Integer 1–12
+  year:  2026     # Four-digit year ≥ 1940
+  output_dir: "."  # Directory for soldata.srt; set to your WD if needed
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(DBI)
+library(RMySQL)      # swap for RMariaDB if using a MariaDB server
+library(tidyverse)
+library(stringr)
+library(knitr)
+library(kableExtra)
+```
+
+## Parameters
+
+```{r}
+#| label: params-validate
+
+# Pull params and validate ---------------------------------------------------
+month <- as.integer(params$month)
+year  <- as.integer(params$year)
+
+stopifnot(
+  "month must be 1–12"    = month >= 1L & month <= 12L,
+  "year must be ≥ 1940"   = year  >= 1940L
+)
+
+month_names <- c("Jan","Feb","Mar","Apr","May","Jun",
+                 "Jul","Aug","Sep","Oct","Nov","Dec")
+monthyr <- paste(month_names[month], year)   # e.g. "Mar 2026"
+
+WD <- params$output_dir
+
+cat("Processing:", monthyr, "\n")
+```
+
+Processing month-year: **`r monthyr`**
+
+---
+
+## Default fill-in values
+
+Used when an observer has no `k` or weight (`Scale`) in `sun_obsconst`.
+Keep consistent with historical values to avoid shifts in long-term statistics.
+
+```{r}
+#| label: defaults
+
+K_DEFAULT <- 1.0
+W_DEFAULT <- 0.1   # "Scale" / weight
+```
+
+---
+
+## Database connection
+
+Credentials are read from environment variables so they are never stored in
+the document source.  Set them in your `.Renviron` or shell before rendering:
+
+```
+SOLAR_DB=solar
+SOLAR_HOST=localhost
+SOLAR_USER=youruser
+SOLAR_PASS=yourpass
+```
+
+```{r}
+#| label: db-connect
+
+DB_NAME <- Sys.getenv("SOLAR_DB",   "solar")
+DB_HOST <- Sys.getenv("SOLAR_HOST", "localhost")
+DB_USER <- Sys.getenv("SOLAR_USER", "")
+DB_PASS <- Sys.getenv("SOLAR_PASS", "")
+
+dbh <- dbConnect(
+  RMySQL::MySQL(),
+  dbname   = DB_NAME,
+  host     = DB_HOST,
+  user     = DB_USER,
+  password = DB_PASS
+)
+```
+
+---
+
+## Fetch observations {#sec-fetch-obs}
+
+Pulls unrevised records for the selected month, excluding internal/test
+observers `BSJ1`, `TMT`, and `WEO`.
+
+```{r}
+#| label: fetch-obs
+
+sql_obs <- "
+  SELECT uid, date, monthyr, day, see, UT,
+         g, s, W, ng, sg, ns, ss, cg, cs,
+         Obs, Remarks, header_id, submitted, revised
+  FROM   sun_data
+  WHERE  monthyr  = ?
+    AND  revised  = 0
+    AND  Obs NOT IN ('BSJ1','TMT','WEO')
+  ORDER  BY Obs, day, UT
+"
+obs <- dbGetQuery(dbh, sql_obs, params = list(monthyr))
+colnames(obs) <- c("uid","date","monthyr","day","see","UT",
+                   "g","s","W","ng","sg","ns","ss","cg","cs",
+                   "Obs","Remarks","header_id","submitted","revised")
+
+n_obs       <- nrow(obs)
+n_observers <- n_distinct(obs$Obs)
+cat(sprintf("Retrieved %d observations from %d observer(s).\n",
+            n_obs, n_observers))
+
+# Early exit if no data — stops rendering cleanly without an error page
+if (n_obs == 0L) {
+  cat("No data found for", monthyr, "— nothing to do.\n")
+  dbDisconnect(dbh)
+  knitr::knit_exit()
+}
+```
+
+**`r n_obs`** observations from **`r n_observers`** observer(s) retrieved for `r monthyr`.
+
+---
+
+## Fetch observer constants {#sec-obs-const}
+
+```{r}
+#| label: fetch-obsconst
+
+olist <- unique(obs$Obs)
+
+sql_const <- sprintf(
+  "SELECT k, Scale, name, Obs, AAVSO_obscode, SIDC_submitter, updated
+   FROM   sun_obsconst
+   WHERE  Obs IN (%s)",
+  paste(rep("?", length(olist)), collapse = ",")
+)
+obsconst <- dbGetQuery(dbh, sql_const, params = as.list(olist))
+colnames(obsconst) <- c("k","Scale","name","Obs","AAVSO","SIDC","updated")
+
+# Apply defaults for missing / zero values
+obsconst <- obsconst |>
+  mutate(
+    k     = if_else(is.na(k)     | k     == 0, K_DEFAULT, k),
+    Scale = if_else(is.na(Scale) | Scale == 0, W_DEFAULT, Scale)
+  )
+```
+
+```{r}
+#| label: tbl-obsconst
+#| tbl-cap: "Observer constants used in this run"
+
+obsconst |>
+  select(Obs, name, k, Scale, AAVSO, SIDC, updated) |>
+  arrange(Obs) |>
+  kbl(booktabs = TRUE, linesep = "") |>
+  kable_styling(latex_options = c("striped","hold_position"),
+                full_width    = FALSE)
+```
+
+---
+
+## Julian Date helpers {#sec-jd}
+
+Direct port of the original JULIAN0 QuickBasic algorithm used in the Perl
+script. Results are Modified Julian Dates (MJD).
+
+```{r}
+#| label: jd-functions
+
+# julian_zero(): MJD base for day 0 of the given month/year
+julian_zero <- function(nmo, nyear) {
+  nmon <- c(0L, 0L, 31L, 59L, 90L, 120L, 151L, 181L, 212L, 243L, 273L, 304L, 334L)
+  nyr  <- if (nyear < 100L) nyear + 2000L else nyear
+  nyr  <- nyr - 1601L
+
+  dtime <- 2305813L
+  while (nyr >= 400L) { nyr <- nyr - 400L; dtime <- dtime + 146097L }
+  while (nyr >= 100L) { nyr <- nyr - 100L; dtime <- dtime + 36524L  }
+  while (nyr >= 4L)   { nyr <- nyr - 4L;   dtime <- dtime + 1461L   }
+
+  dtime <- dtime + (365L * nyr) + nmon[nmo + 1L]  # +1: R is 1-indexed
+  if (nyr == 3L && nmo > 2L) dtime <- dtime + 1L
+  dtime
+}
+
+# old_solarjd(): day + UT string (HHMM) → fractional MJD
+old_solarjd <- function(day, mo, yr, ut) {
+  dtime0 <- julian_zero(mo, yr)
+  nhour  <- as.integer(substr(str_pad(ut, 4, pad = "0"), 1, 2))
+  nmin   <- as.integer(substr(str_pad(ut, 4, pad = "0"), 3, 2))
+  dday   <- ((60.0 * nhour) + nmin) / 1440.0
+  dday + day + dtime0 - 2400000.5
+}
+
+# Vectorised wrapper for use inside mutate()
+solar_jd_vec <- function(day, ut, mo = month, yr = year) {
+  mapply(old_solarjd, day, mo, yr, ut)
+}
+```
+
+---
+
+## Compute derived quantities {#sec-compute}
+
+```{r}
+#| label: compute
+
+results <- obs |>
+  left_join(obsconst, by = "Obs") |>
+  mutate(
+    # Fill any observers absent from obsconst
+    name  = coalesce(name,  "OBS NOT IN OBSCONST!"),
+    k     = coalesce(k,     K_DEFAULT),
+    Scale = coalesce(Scale, W_DEFAULT),
+
+    # Julian date
+    JD = solar_jd_vec(day, UT),
+
+    # Wolf number sanity check
+    count_calc = s + 10L * g,
+    W_match    = (count_calc == W)
+  )
+```
+
+### Wolf number mismatch check
+
+```{r}
+#| label: mismatch-check
+
+mismatches <- filter(results, !W_match)
+n_mm <- nrow(mismatches)
+
+if (n_mm > 0L) {
+  cat(sprintf("WARNING: %d observation(s) where submitted W ≠ s + 10g:\n", n_mm))
+  mismatches |>
+    select(uid, Obs, day, g, s, W, count_calc) |>
+    kbl(booktabs = TRUE) |>
+    kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+    print()
+} else {
+  cat("All W values match s + 10g. No mismatches found.\n")
+}
+```
+
+### Calculate kc, log(c), log(kc)
+
+```{r}
+#| label: compute-logs
+
+results <- results |>
+  mutate(
+    # k-corrected Wolf number (4 d.p., matching original)
+    kcount = round(W * k, 4),
+
+    # Log10; NA → sentinel string "-.----"
+    logcount  = if_else(W      > 0, round(log10(W),      4), NA_real_),
+    logkcount = if_else(kcount > 0, round(log10(kcount), 4), NA_real_),
+
+    lc_str = if_else(
+      is.na(logcount),
+      "-.----",
+      str_pad(formatC(logcount,  format = "f", digits = 4), 6, side = "right", pad = "0")
+    ),
+    lk_str = if_else(
+      is.na(logkcount),
+      "-.----",
+      str_pad(formatC(logkcount, format = "f", digits = 4), 6, side = "right", pad = "0")
+    ),
+
+    # Name truncated to 20 characters (matches original printf field width)
+    name_short = str_trunc(name, 20, ellipsis = "")
+  ) |>
+  arrange(JD)
+```
+
+### Preview
+
+```{r}
+#| label: tbl-results-preview
+#| tbl-cap: "First 10 rows of computed results (sorted by JD)"
+
+results |>
+  slice_head(n = 10) |>
+  select(JD, Obs, day, g, s, W, k, kcount, lc_str, lk_str, Scale, see) |>
+  kbl(booktabs = TRUE, digits = 4, linesep = "") |>
+  kable_styling(latex_options = c("striped","hold_position","scale_down"),
+                full_width    = FALSE)
+```
+
+---
+
+## Write `soldata.srt` {#sec-write}
+
+Output format matches the original Perl `printf` exactly so downstream
+tools that consume `soldata.srt` are unaffected.
+
+```{r}
+#| label: write-srt
+
+output_file <- file.path(WD, "soldata.srt")
+
+header_line <- "   JD         g    s   c     kc   log(c) log(kc)  w   Obs.      Obs. Name"
+
+lines <- results |>
+  mutate(
+    line = sprintf(
+      "%10.4f %4i %4i %4i %7.2f %6s %6s %5.3f %-4s %-20s   | %s",
+      JD, g, s, W, kcount, lc_str, lk_str, Scale, Obs, name_short, see
+    )
+  ) |>
+  pull(line)
+
+writeLines(c(header_line, lines), con = output_file)
+cat(sprintf("Wrote %d data line(s) to: %s\n", length(lines), output_file))
+```
+
+---
+
+## Mark observations as published {#sec-publish}
+
+A single `UPDATE … WHERE uid IN (…)` replaces the original row-by-row loop.
+
+```{r}
+#| label: mark-published
+
+publish_uids <- obs$uid
+uid_list     <- paste(publish_uids, collapse = ",")
+sql_publish  <- sprintf(
+  "UPDATE sun_data SET published = 1 WHERE uid IN (%s)", uid_list
+)
+rows_updated <- dbExecute(dbh, sql_publish)
+cat(sprintf("Marked %d observation(s) as published.\n", rows_updated))
+```
+
+---
+
+## Disconnect {#sec-disconnect}
+
+```{r}
+#| label: db-disconnect
+
+dbDisconnect(dbh)
+cat("Database connection closed.\n")
+```
+
+---
+
+## Session info
+
+```{r}
+#| label: session-info
+#| code-fold: true
+
+sessionInfo()
+```
