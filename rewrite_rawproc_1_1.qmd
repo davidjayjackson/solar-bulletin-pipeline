@@ -1,0 +1,266 @@
+---
+title: "AAVSO Solar Raw Processing"
+subtitle: "Port of RAWPROC_DB.PL v1.0 — Matthew Templeton, AAVSO HQ (2012-06-13)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    self-contained: true
+  pdf:
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  month: 4        # Integer 1–12
+  year:  2026     # Four-digit year ≥ 1940
+  output_dir: "."  # Directory for soldata.srt; set to your WD if needed
+---
+```{r}
+# Load Libraries
+#
+#| label: setup
+#| include: false
+rm(list = ls())
+library(DBI)
+library(RMariaDB)      
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(lubridate)
+library(glue)
+library(writexl)
+```
+
+```{r}
+rm(list=ls())
+#| label: db-connect
+
+dbh <- dbConnect(
+  RMariaDB::MariaDB(),
+  dbname   = "aavso",
+  host     = "localhost",
+  user     = "root",
+  password = "dJj135790",
+  port     = 3333
+)
+```
+
+# Grab Data
+
+```{r}
+#| label: defaults
+
+K_DEFAULT <- 1.0
+W_DEFAULT <- 0.1   # "Scale" / weight
+```
+
+```{r}
+# Pull April 2206 Observations
+sun_data <- tbl(dbh,"sun_data") |> collect() |> filter(monthyr =="Apr 2026") |> rename(dom = day) 
+# Julian date
+sun_data <- sun_data |>
+  mutate(
+    XX         = as.numeric(date),
+    JD   = as.Date(XX - 2440587.5, origin = "1970-01-01")
+  ) 
+```
+```{r}
+# Create table with one row per Obs
+sun_header <- tbl(dbh,"sun_header") |> collect()
+observers <- sun_header |>
+  select(Obs, name, updated,method,inst) |>
+  arrange(Obs, desc(updated)) |>
+  slice_max(updated, by = Obs, n = 1, with_ties = FALSE)
+
+
+n_obs       <- nrow(observers)
+n_observers <- n_distinct(observers$Obs)
+cat(sprintf("Retrieved %d observations from %d observer(s).\n",
+            n_obs, n_observers))
+
+# Early exit if no data — stops rendering cleanly without an error page
+if (n_obs == 0L) {
+  cat("No data found for", monthyr, "— nothing to do.\n")
+  dbDisconnect(dbh)
+  knitr::knit_exit()
+}
+
+```
+
+```{r}
+# Create Table of Lat K Value
+obsconst <- tbl(dbh,"sun_obsconst") |> collect()
+kvalues <- obsconst |>
+  select(Obs,k,updated,Scale) |>
+  arrange(Obs, desc(updated)) |>
+  slice_max(updated, by = Obs, n = 1, with_ties = FALSE)
+
+# Apply defaults for missing / zero values
+kvalues <- kvalues |>
+  mutate(
+    k     = if_else(is.na(k)     | k     == 0, K_DEFAULT, k),
+    Scale = if_else(is.na(Scale) | Scale == 0, W_DEFAULT, Scale)
+  )
+
+# dbWriteTable(dbh,"kvalues",kvalues, overwrite=TRUE)
+```
+
+
+## Compute derived quantities {#sec-compute}
+
+```{r}
+#| label: compute
+results <- sun_data |>
+  inner_join(kvalues,by="Obs") |>
+  mutate(
+    # Fill any observers absent from obsconst
+  #  name  = coalesce(name,  "OBS NOT IN OBSCONST!"),
+    k     = coalesce(k,     K_DEFAULT),
+    Scale = coalesce(Scale, W_DEFAULT),
+    # Wolf number sanity check
+    count_calc = s + 10L * g,
+    W_match    = (count_calc == W) 
+  )
+```
+
+```{r}
+# Monthlyr Raw Sun
+
+
+ monthly_raw <- sun_data |> group_by(dom) |> summarize(
+      min_w = min(W,na.rm=TRUE),
+      max_w = max(W,na.rm=TRUE),
+      mean_w = mean(W,na.rm=TRUE),
+      med_w = median(W,na.rm=TRUE),
+      row_cnt = n(),
+      # Spots
+      min_s = min(s,na.rm=TRUE),
+      max_s = max(s,na.rm=TRUE),
+      mean_s = mean(s,na.rm=TRUE),
+      med_s = median(s,na.rm=TRUE),
+      # Groups
+      min_g = min(g,na.rm=TRUE),
+      max_g = max(g,na.rm=TRUE),
+      mean_g = mean(g,na.rm=TRUE),
+      med_g = median(g,na.rm=TRUE)
+      
+  ) |> ungroup()
+```
+
+
+### Wolf number mismatch check
+
+```{r}
+#| label: mismatch-check
+
+mismatches <- filter(results, !W_match)
+n_mm <- nrow(mismatches)
+
+if (n_mm > 0L) {
+  cat(sprintf("WARNING: %d observation(s) where submitted W != s + 10g:\n", n_mm))
+  mismatches |>
+    select(uid, Obs, day, g, s, W, count_calc) |>
+    kbl(booktabs = TRUE) |>
+    kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+    print()
+} else {
+  cat("All W values match s + 10g. No mismatches found.\n")
+}
+```
+
+### Calculate kc, log(c), log(kc)
+
+```{r}
+#| label: compute-logs
+
+results1 <- results |>
+  mutate(
+    # k-corrected Wolf number (4 d.p., matching original)
+    kcount = round(W * k, 4),
+
+    # Log10; NA -> sentinel string "-.----"
+    logcount  = if_else(W      > 0, round(log10(W),      4), NA_real_),
+    logkcount = if_else(kcount > 0, round(log10(kcount), 4), NA_real_),
+
+    # formatC width=6 right-justifies to match %6s in the output sprintf
+    lc_str = if_else(
+      is.na(logcount),
+      "-.----",
+      formatC(logcount,  format = "f", digits = 4, width = 6)
+    ),
+    lk_str = if_else(
+      is.na(logkcount),
+      "-.----",
+      formatC(logkcount, format = "f", digits = 4, width = 6)
+    ),
+
+    # Name truncated to 20 characters (matches original printf field width)
+   # name_short = str_trunc(name, 20, ellipsis = "") 
+  ) |>
+  arrange(JD)
+
+results2 <- results1 |>
+  inner_join(observers,by="Obs") |>
+  mutate(name_short = str_trunc(name, 20, ellipsis = ""))
+
+```
+
+### Preview
+
+```{r}
+#| label: tbl-results-preview
+#| tbl-cap: "First 10 rows of computed results (sorted by JD)"
+
+results2 |>
+  slice_head(n = 10) |>
+  select(JD,name_short, Obs, dom, g, s, W, k, kcount, lc_str, lk_str, Scale, see) |>
+  kbl(booktabs = TRUE, digits = 4, linesep = "") |>
+  kable_styling(latex_options = c("striped","hold_position","scale_down"),
+                full_width    = FALSE)
+```
+## Write `soldata.srt` {#sec-write}
+
+Output format matches the original Perl `printf` exactly so downstream
+tools that consume `soldata.srt` are unaffected.
+
+```{r}
+#| label: write-srt
+
+
+
+output_file <- file.path(getwd(), "soldata.srt")
+header_line <- "   JD         g    s   c     kc   log(c) log(kc)  w   Obs.      Obs. Name"
+
+results2 |>
+  mutate(
+    line = glue(
+      "{formatC(JD, format='f', digits=4, width=10)} ",
+      "{formatC(g,  format='d', width=4)} ",
+      "{formatC(s,  format='d', width=4)} ",
+      "{formatC(W,  format='d', width=4)} ",
+      "{formatC(kcount, format='f', digits=2, width=7)} ",
+      "{str_pad(lc_str,  6, 'left')} ",
+      "{str_pad(lk_str,  6, 'left')} ",
+      "{formatC(Scale, format='f', digits=3, width=5)} ",
+      "{str_pad(Obs,   4, 'right')} ",
+      "{str_pad(name_short, 20, 'right')}   | {see}",
+      .sep = ""
+    )
+  ) |>
+  pull(line) |>
+  (\(lines) {
+    writeLines(c(header_line, lines), con = output_file)
+    cat(sprintf("Wrote %d data line(s) to: %s\n", length(lines), output_file))
+  })()
+
+# Write Results Data.frame to Excel sheet
+
+results2 |> select(JD,g,s,W,kcount,lc_str,lk_str,Scale,Obs,name_short,see) |> write_xlsx("results.xlsx")
+```
+
+
+
