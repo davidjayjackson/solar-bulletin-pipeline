@@ -1,0 +1,55 @@
+---
+title: "Bert's Compsol Db Script"
+subtitle: "Port of RAWPROC_DB.PL v1.0 — Matthew Templeton, AAVSO HQ (2012-06-13)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    self-contained: true
+  pdf:
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+```{r}
+library(tidyverse)
+library(DBI)
+library(RMariaDB)
+```
+```{r}
+
+
+DB_HOST   <- "localhost"
+DB_NAME   <- "aavso"
+DB_USER   <- "root"
+DB_PASS   <- "dJj135790"
+
+ con <- dbConnect(
+    RMariaDB::MariaDB(),
+    host     = host,
+    dbname   = dbname,
+    username = user,
+    password = pass
+  )
+  on.exit(dbDisconnect(con))
+
+INPUT_FILE  <- "solardata.srt"
+OUTPUT_FILE <- "soldata.txt"
+
+# Fallback k and weight for observers not found in sun_obsconst
+DEFAULT_K      <- 1.0
+DEFAULT_WEIGHT <- 0.05
+```
+# ---------------------------------------------------------------------------
+# 1.  Read the fixed-width input file
+# ---------------------------------------------------------------------------
+
+```{r}

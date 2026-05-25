@@ -1,0 +1,384 @@
+---
+title: "AAVSO Solar Raw Processing"
+subtitle: "Port of RAWPROC_DB.PL v1.0 — Matthew Templeton, AAVSO HQ (2012-06-13)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    self-contained: true
+  pdf:
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  month: 4        # Integer 1–12
+  year:  2026     # Four-digit year ≥ 1940
+  output_dir: "."  # Directory for soldata.srt; set to your WD if needed
+---
+```{r}
+# Load Libraries
+#
+#| label: setup
+#| include: false
+rm(list = ls())
+library(DBI)
+library(RMariaDB)      
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(lubridate)
+library(glue)
+library(writexl)
+```
+
+```{r}
+#| label: db-connect
+
+dbh <- dbConnect(
+  RMariaDB::MariaDB(),
+  dbname   = "aavso",
+  host     = "localhost",
+  user     = "root",
+  password = "dJj135790",
+  port     = 3333
+)
+```
+
+# Grab Data
+
+```{r}
+#| label: defaults
+
+K_DEFAULT <- 1.0
+W_DEFAULT <- 0.1   # "Scale" / weight
+```
+
+```{r}
+# Pull April 2206 Observations
+sun_data <- tbl(dbh,"sun_data") |> collect() |> filter(monthyr =="Apr 2026")
+```
+```{r}
+# Create table with one row per Obs
+sun_header <- tbl(dbh,"sun_header") |> collect()
+observers <- sun_header |>
+  select(Obs, name, updated,method) |>
+  arrange(Obs, desc(updated)) |>
+  slice_max(updated, by = Obs, n = 1, with_ties = FALSE)
+
+
+n_obs       <- nrow(observers)
+n_observers <- n_distinct(observers$Obs)
+cat(sprintf("Retrieved %d observations from %d observer(s).\n",
+            n_obs, n_observers))
+
+# Early exit if no data — stops rendering cleanly without an error page
+if (n_obs == 0L) {
+  cat("No data found for", monthyr, "— nothing to do.\n")
+  dbDisconnect(dbh)
+  knitr::knit_exit()
+}
+
+```
+
+```{r}
+# Create Table of Lat K Value
+obsconst <- tbl(dbh,"sun_obsconst") |> collect()
+kvalues <- obsconst |>
+  select(Obs,k,updated,Scale) |>
+  arrange(Obs, desc(updated)) |>
+  slice_max(updated, by = Obs, n = 1, with_ties = FALSE)
+
+# Apply defaults for missing / zero values
+kvalues <- kvalues |>
+  mutate(
+    k     = if_else(is.na(k)     | k     == 0, K_DEFAULT, k),
+    Scale = if_else(is.na(Scale) | Scale == 0, W_DEFAULT, Scale)
+  )
+
+# dbWriteTable(dbh,"kvalues",kvalues, overwrite=TRUE)
+```
+
+## Julian Date helpers {#sec-jd}
+
+Direct port of the original JULIAN0 QuickBasic algorithm used in the Perl
+script. Results are Modified Julian Dates (MJD).
+```{r}
+#| label: jd-functions
+
+# # julian_zero(): MJD base for day 0 of the given month/year
+# julian_zero <- function(nmo, nyear) {
+#   nmon <- c(0L, 0L, 31L, 59L, 90L, 120L, 151L, 181L, 212L, 243L, 273L, 304L, 334L)
+#   nyr  <- if (nyear < 100L) nyear + 2000L else nyear
+#   nyr  <- nyr - 1601L
+# 
+#   dtime <- 2305813L
+#   while (nyr >= 400L) { nyr <- nyr - 400L; dtime <- dtime + 146097L }
+#   while (nyr >= 100L) { nyr <- nyr - 100L; dtime <- dtime + 36524L  }
+#   while (nyr >= 4L)   { nyr <- nyr - 4L;   dtime <- dtime + 1461L   }
+# 
+#   dtime <- dtime + (365L * nyr) + nmon[nmo + 1L]  # +1: R is 1-indexed
+#   if (nyr == 3L && nmo > 2L) dtime <- dtime + 1L
+#   dtime
+# }
+# 
+# # old_solarjd(): day + UT string (HHMM) -> fractional MJD
+# old_solarjd <- function(day, mo, yr, ut) {
+#   dtime0 <- julian_zero(mo, yr)
+#   ut_pad <- str_pad(ut, 4, pad = "0")
+#   nhour  <- as.integer(substr(ut_pad, 1, 2))
+#   nmin   <- as.integer(substr(ut_pad, 3, 4))   # fixed: was (3, 2)
+#   dday   <- ((60.0 * nhour) + nmin) / 1440.0
+#   dday + day + dtime0 - 2400000.5
+# }
+# 
+# # Vectorised wrapper for use inside mutate()
+# solar_jd_vec <- function(day, ut, mo = month, yr = year) {
+#   mapply(old_solarjd, day, mo, yr, ut)
+# }
+```
+
+## Compute derived quantities {#sec-compute}
+
+```{r}
+#| label: compute
+sun_data$date <- as.numeric(sun_data$date)
+results <- sun_data |>
+  inner_join(kvalues,by="Obs") |>
+  mutate(
+    # Fill any observers absent from obsconst
+  #  name  = coalesce(name,  "OBS NOT IN OBSCONST!"),
+    k     = coalesce(k,     K_DEFAULT),
+    Scale = coalesce(Scale, W_DEFAULT),
+
+    # Julian date
+    JD = as_date(date - 2440587.5),
+ #   JD = solar_jd_vec(day, UT),
+
+    # Wolf number sanity check
+    count_calc = s + 10L * g,
+    W_match    = (count_calc == W) 
+  )
+```
+
+```{r}
+# Monthlyr Raw Sun
+
+
+ monthly_raw <- sun_data |> group_by(day) |> summarize(
+      min_w = min(W,na.rm=TRUE),
+      max_w = max(W,na.rm=TRUE),
+      mean_w = mean(W,na.rm=TRUE),
+      med_w = median(W,na.rm=TRUE),
+      row_cnt = n(),
+      # Spots
+      min_s = min(s,na.rm=TRUE),
+      max_s = max(s,na.rm=TRUE),
+      mean_s = mean(s,na.rm=TRUE),
+      med_s = median(s,na.rm=TRUE),
+      # Groups
+      min_g = min(g,na.rm=TRUE),
+      max_g = max(g,na.rm=TRUE),
+      mean_g = mean(g,na.rm=TRUE),
+      med_g = median(g,na.rm=TRUE)
+      
+  ) |> ungroup()
+```
+## Calculate Monthly Numbers using Monthlyr column
+```{r}
+monthly_raw <- sun_data |> group_by(monthyr) |> summarize(
+    min_w = min(W, na.rm = TRUE),
+    max_w = max(W, na.rm = TRUE),
+    mean_w = mean(W, na.rm = TRUE),
+    med_w = median(W, na.rm = TRUE),
+    row_cnt = n(),
+    # Spots
+    min_s = min(s, na.rm = TRUE),
+    max_s = max(s, na.rm = TRUE),
+    mean_s = mean(s, na.rm = TRUE),
+    med_s = median(s, na.rm = TRUE),
+    # Groups
+    min_g = min(g, na.rm = TRUE),
+    max_g = max(g, na.rm = TRUE),
+    mean_g = mean(g, na.rm = TRUE),
+    med_g = median(g, na.rm = TRUE)
+
+) |> ungroup()
+```
+
+## Calcuate using standard date column
+
+```{r}
+monthly_raw <- sun_data |>
+    mutate(month = floor_date(JD, "month")) |>
+    group_by(month) |>
+    summarize(
+        # Raw Wolf Numbers
+        min_w = min(W, na.rm = TRUE),
+        max_w = max(W, na.rm = TRUE),
+        mean_w = mean(W, na.rm = TRUE),
+        med_w = median(W, na.rm = TRUE),
+        row_cnt = n(),
+        # Spots
+        min_s = min(s, na.rm = TRUE),
+        max_s = max(s, na.rm = TRUE),
+        mean_s = mean(s, na.rm = TRUE),
+        med_s = median(s, na.rm = TRUE),
+        # Groups
+        min_g = min(g, na.rm = TRUE),
+        max_g = max(g, na.rm = TRUE),
+        mean_g = mean(g, na.rm = TRUE),
+        med_g = median(g, na.rm = TRUE)
+
+    ) |> ungroup()
+``
+
+
+### Wolf number mismatch check
+
+```{r}
+#| label: mismatch-check
+
+mismatches <- filter(results, !W_match)
+n_mm <- nrow(mismatches)
+
+if (n_mm > 0L) {
+  cat(sprintf("WARNING: %d observation(s) where submitted W != s + 10g:\n", n_mm))
+  mismatches |>
+    select(uid, Obs, day, g, s, W, count_calc) |>
+    kbl(booktabs = TRUE) |>
+    kable_styling(latex_options = "hold_position", full_width = FALSE) |>
+    print()
+} else {
+  cat("All W values match s + 10g. No mismatches found.\n")
+}
+```
+
+### Calculate kc, log(c), log(kc)
+
+```{r}
+#| label: compute-logs
+
+results <- results |>
+  mutate(
+    # k-corrected Wolf number (4 d.p., matching original)
+    kcount = round(W * k, 4),
+
+    # Log10; NA -> sentinel string "-.----"
+    logcount  = if_else(W      > 0, round(log10(W),      4), NA_real_),
+    logkcount = if_else(kcount > 0, round(log10(kcount), 4), NA_real_),
+
+    # formatC width=6 right-justifies to match %6s in the output sprintf
+    lc_str = if_else(
+      is.na(logcount),
+      "-.----",
+      formatC(logcount,  format = "f", digits = 4, width = 6)
+    ),
+    lk_str = if_else(
+      is.na(logkcount),
+      "-.----",
+      formatC(logkcount, format = "f", digits = 4, width = 6)
+    ),
+
+    # Name truncated to 20 characters (matches original printf field width)
+   # name_short = str_trunc(name, 20, ellipsis = "") 
+  ) |>
+  arrange(JD)
+
+results <- results |>
+  inner_join(observers) |>
+  mutate(name_short = str_trunc(name, 20, ellipsis = ""))
+
+```
+
+### Preview
+
+```{r}
+#| label: tbl-results-preview
+#| tbl-cap: "First 10 rows of computed results (sorted by JD)"
+
+results |>
+  slice_head(n = 10) |>
+  select(JD,name_short, Obs, day, g, s, W, k, kcount, lc_str, lk_str, Scale, see) |>
+  kbl(booktabs = TRUE, digits = 4, linesep = "") |>
+  kable_styling(latex_options = c("striped","hold_position","scale_down"),
+                full_width    = FALSE)
+```
+## Write `soldata.srt` {#sec-write}
+
+Output format matches the original Perl `printf` exactly so downstream
+tools that consume `soldata.srt` are unaffected.
+
+```{r}
+#| label: write-srt
+
+
+
+output_file <- file.path(getwd(), "soldata.srt")
+header_line <- "   JD         g    s   c     kc   log(c) log(kc)  w   Obs.      Obs. Name"
+
+results |>
+  mutate(
+    line = glue(
+      "{formatC(JD, format='f', digits=4, width=10)} ",
+      "{formatC(g,  format='d', width=4)} ",
+      "{formatC(s,  format='d', width=4)} ",
+      "{formatC(W,  format='d', width=4)} ",
+      "{formatC(kcount, format='f', digits=2, width=7)} ",
+      "{str_pad(lc_str,  6, 'left')} ",
+      "{str_pad(lk_str,  6, 'left')} ",
+      "{formatC(Scale, format='f', digits=3, width=5)} ",
+      "{str_pad(Obs,   4, 'right')} ",
+      "{str_pad(name_short, 20, 'right')}   | {see}",
+      .sep = ""
+    )
+  ) |>
+  pull(line) |>
+  (\(lines) {
+    writeLines(c(header_line, lines), con = output_file)
+    cat(sprintf("Wrote %d data line(s) to: %s\n", length(lines), output_file))
+  })()
+
+# Write Results Data.frame to Excel sheet
+
+results |> select(JD,g,s,W,kcount,lc_str,lk_str,Scale,Obs,name_short,see) |> write_xlsx("results.xlsx")
+```
+
+## Plot Monthly Raw Numbers
+### Wolf
+
+```{r}
+ggplot(monthly_raw) + 
+  geom_line(aes(x=day, y=min_w, colour="Min"), linewidth=2) +
+  geom_line(aes(x=day, y=max_w, colour="Max"), linewidth=2) +
+  geom_line(aes(x=day, y=mean_w, colour="Mean"), linewidth=2) + 
+  theme_light() +
+  labs(title="Minimum, Average, and Maximum Raw W (wolf)", y="Raw Wolf") +
+  theme(legend.position = "bottom")
+``` 
+
+### Spots
+
+```{r}
+ggplot(monthly_raw) + 
+  geom_area(aes(x=day, y=min_s, colour="Min",fill="Min"), linewidth=2) +
+  geom_area(aes(x=day, y=max_s, colour="Max"), linewidth=2) +
+  geom_area(aes(x=day, y=mean_s, colour="Mean"), linewidth=2) + 
+  theme_light() +
+  labs(title="Minimum, Average, and Maximum Spots", y="Spots") +
+  theme(legend.position = "bottom")
+``` 
+### Spots
+
+```{r}
+ggplot(monthly_raw) + 
+  geom_line(aes(x=day, y=min_g, colour="Min"), linewidth=2) +
+  geom_line(aes(x=day, y=max_g, colour="Max"), linewidth=2) +
+  geom_line(aes(x=day, y=mean_g, colour="Mean"), linewidth=2) + 
+  theme_light() +
+  labs(title="Minimum, Average, and Maximum Groups", y="Groups") +
+  theme(legend.position = "bottom")
+``` 

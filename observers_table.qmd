@@ -1,0 +1,115 @@
+---
+title: "Solar Bulletin Observer Table"
+format: pdf
+execute:
+  echo: false
+  message: false
+  warning: false
+header-includes:
+  - \usepackage{longtable}
+  - \usepackage{booktabs}
+---
+
+```{r setup}
+library(DBI)
+library(RMariaDB)
+library(xtable)
+library(knitr)
+library(kableExtra)
+
+# --- Parameters: edit these each month ---
+month <- 4
+year  <- 2026
+```
+
+```{r query}
+monthyr <- paste(month.abb[month], year)
+caption_label <- paste0(year, sprintf("%02d", month))
+
+con <- dbConnect(
+  RMariaDB::MariaDB(),
+  dbname   = "aavso",
+  host     = "localhost",
+  user     = "root",
+  password = "dJj135790",
+  port     = 3333
+)
+
+obs_query <- sprintf("
+  SELECT d.Obs, COUNT(*) AS n_obs, c.name AS observer_name
+  FROM sun_data d
+  LEFT JOIN sun_obsconst c
+    ON d.Obs = c.Obs AND c.revised = 0
+  WHERE d.monthyr = '%s'
+    AND d.revised = 0
+    AND d.Obs NOT IN ('BSJ1', 'TMT', 'WEO')
+  GROUP BY d.Obs, c.name
+  ORDER BY d.Obs
+", monthyr)
+
+result <- dbGetQuery(con, obs_query)
+dbDisconnect(con)
+```
+
+```{r build-table}
+df <- data.frame(
+  `Observer Code`          = result$Obs,
+  `Number of Observations` = as.integer(result$n_obs),
+  `Observer Name`          = gsub("&", "/",
+                               ifelse(is.na(result$observer_name), "UNKNOWN",
+                                      result$observer_name),
+                               fixed = TRUE),
+  check.names = FALSE
+)
+
+totals_row <- data.frame(
+  `Observer Code`          = "Totals",
+  `Number of Observations` = sum(df$`Number of Observations`),
+  `Observer Name`          = as.character(nrow(df)),
+  check.names = FALSE
+)
+
+df_with_totals <- rbind(df, totals_row)
+```
+
+```{r render-table}
+kbl(
+  df_with_totals,
+  format    = "latex",
+  booktabs  = TRUE,
+  longtable = TRUE,
+  caption   = paste0(caption_label, " Number of observations by observer."),
+  label     = "obs",
+  col.names = c("Observer Code", "Number of Observations", "Observer Name")
+) |>
+  kable_styling(
+    latex_options = c("repeat_header"),
+    font_size     = 10
+  ) |>
+  row_spec(nrow(df_with_totals) - 1, hline_after = TRUE)
+```
+
+```{r write-tex}
+tbl <- xtable(
+  df_with_totals,
+  caption = paste0(caption_label, " Number of observations by observer."),
+  label   = "tab:obs"
+)
+
+print(tbl,
+  tabular.environment    = "longtable",
+  floating               = FALSE,
+  include.rownames       = FALSE,
+  hline.after            = c(-1, 0, nrow(df_with_totals) - 1, nrow(df_with_totals)),
+  add.to.row = list(
+    pos     = list(0),
+    command = c(
+      "  \\toprule \nObserver & Number of & \\\\ \nCode & Observations & Observer Name \\\\\n\\hline \n\\endhead \n\\hline \n{\\footnotesize Continued} \n\\endfoot \n\\endlastfoot\n"
+    )
+  ),
+  sanitize.text.function = identity,
+  file = paste0(caption_label, "Observers.tex")
+)
+
+cat("Written to", paste0(caption_label, "Observers.tex"), "\n")
+```

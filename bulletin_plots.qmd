@@ -1,0 +1,58 @@
+---
+title: "Create Min/Max/Med Reports"
+format: html
+editor: visual
+---
+
+```{r,echo=FALSE,message=FALSE}
+library(tidyverse)
+library(DBI)
+library(RMariaDB)      # swap for RMariaDB if using a MariaDB server
+library(stringr)
+library(knitr)
+library(kableExtra)
+
+DB_NAME <- Sys.getenv("SOLAR_DB",   )
+DB_HOST <- Sys.getenv("SOLAR_HOST", )
+DB_USER <- Sys.getenv("SOLAR_USER", "root")
+DB_PASS <- Sys.getenv("SOLAR_PASS", )
+
+con <- dbConnect(
+  RMariaDB::MariaDB(),
+  dbname   = "aavso",
+  host     = "localhost",
+  user     = "root",
+  password = "dJj135790",
+  port = 3333
+)
+```
+
+# Calculate Monthly Raw W
+
+```{r}
+# Monthlyr Raw Sun
+monthly <- tbl(con,"sun_data") |> collect()|> filter(monthyr=="Apr 2026") 
+
+ monthly_raw <- monthly |> group_by(day) |> summarize(
+      min_w = min(W,na.rm=TRUE),
+      max_w = max(W,na.rm=TRUE),
+      mean_w = mean(W,na.rm=TRUE),
+      med_w = median(W,na.rm=TRUE),
+      row_cnt = n()
+      
+  ) |> ungroup()
+```
+
+## Plot Monthly Raw Numbers
+
+```{r}
+ggplot(monthly_raw) + geom_line(aes(x=day,y=min_w,colour="Min")) +
+                   geom_line(aes(x=day,y=max_w,colour="Max")) +
+                     geom_line(aes(x=day,y=mean_w,colour="Mean")) + theme_minimal()
+
+```
+## Count of Observations by Day
+
+```{r}
+ggplot(monthly_raw) + geom_line(aes(x=day,y=row_cnt))
+```
