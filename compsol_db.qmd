@@ -1,0 +1,301 @@
+---
+title: "AAVSO Solar Composite"
+subtitle: "Tidyverse port of COMPSOL_DB.PL v1.0.2 — Matthew Templeton, AAVSO HQ (2012-06-15)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    self-contained: true
+  pdf:
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  month: 5        # Integer 1–12
+  year:  2026     # Four-digit year ≥ 1940
+  output_dir: "."
+---
+
+```{r setup, include=FALSE}
+library(DBI)
+library(RMariaDB)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(glue)
+```
+
+```{r constants}
+K_DEFAULT <- 1.0    # fallback k-value when observer has none
+W_DEFAULT <- 0.05   # fallback Scale/weight (compsol uses 0.05, not 0.1)
+
+months_lut  <- c("XXX","Jan","Feb","Mar","Apr","May","Jun",
+                 "Jul","Aug","Sep","Oct","Nov","Dec")
+
+stopifnot(params$month >= 1L, params$month <= 12L, params$year >= 1940L)
+
+monthyr_str <- paste0(months_lut[params$month], " ", params$year)
+```
+
+```{r connect}
+dbh <- dbConnect(
+  RMariaDB::MariaDB(),
+  dbname   = "aavso",
+  host     = "localhost",
+  user     = "root",
+  password = "dJj135790",
+  port     = 3333
+)
+```
+
+## Helper functions
+
+```{r jd-helpers}
+# Days before the start of each month in a non-leap year (month 1..12).
+.nmon <- c(0L, 31L, 59L, 90L, 120L, 151L, 181L, 212L, 243L, 273L, 304L, 334L)
+
+# Port of Perl julian_zero($month, $year)
+julian_zero <- function(month, year) {
+  nyr   <- as.integer(year)
+  if (nyr < 100L) nyr <- nyr + 2000L
+  nyr   <- nyr - 1601L
+  dtime <- 2305813L
+  while (nyr >= 400L) { nyr <- nyr - 400L; dtime <- dtime + 146097L }
+  while (nyr >= 100L) { nyr <- nyr - 100L; dtime <- dtime + 36524L  }
+  while (nyr >= 4L)   { nyr <- nyr - 4L;   dtime <- dtime + 1461L   }
+  dtime <- dtime + 365L * nyr + .nmon[month]
+  if (nyr == 3L && month > 2L) dtime <- dtime + 1L
+  dtime
+}
+
+# Port of Perl old_solarjd($day, $month, $year, $ut)
+# ut is a 4-character string "HHMM"; numeric values are zero-padded automatically.
+# Returns Modified Julian Date (MJD = JD - 2,400,000.5).
+old_solarjd <- function(day, month, year, ut) {
+  ut_str <- str_pad(as.character(ut), 4L, side = "left", pad = "0")
+  nhour  <- as.integer(substr(ut_str, 1L, 2L))
+  nmin   <- as.integer(substr(ut_str, 3L, 4L))
+  frac   <- ((60L * nhour) + nmin) / 1440.0
+  frac + day + julian_zero(month, year) - 2400000.5
+}
+
+# Round-half-up — matches Perl int(x + 0.5)
+round_half_up <- function(x, digits = 0L) {
+  floor(x * 10^digits + 0.5) / 10^digits
+}
+```
+
+## Fetch observations
+
+```{r fetch-obs}
+sun_data <- tbl(dbh, "sun_data") |>
+  filter(
+    monthyr == monthyr_str,
+    revised == 0L,
+    !Obs %in% c("BSJ1", "TMT", "WEO", "SSTW", "ARUB")
+  ) |>
+  collect() |>
+  arrange(Obs, day, UT)
+
+n_data      <- nrow(sun_data)
+n_observers <- n_distinct(sun_data$Obs)
+
+cat(sprintf("There were %d observations by %d observers.\n", n_data, n_observers))
+
+if (n_data == 0L) {
+  cat("No data found for", monthyr_str, "— nothing to do.\n")
+  dbDisconnect(dbh)
+  knitr::knit_exit()
+}
+```
+
+## Fetch observer constants
+
+compsol uses `revised = 0` when querying observer constants.
+
+```{r fetch-obsconst}
+olist <- unique(sun_data$Obs)
+
+obsconst <- tbl(dbh, "sun_obsconst") |>
+  filter(Obs %in% olist, revised == 0L) |>
+  collect() |>
+  select(Obs, k, Scale, name, updated) |>
+  arrange(Obs, desc(updated)) |>
+  slice_max(updated, by = Obs, n = 1L, with_ties = FALSE) |>
+  mutate(
+    k     = if_else(is.na(k)     | k     == 0, K_DEFAULT, k),
+    Scale = if_else(is.na(Scale) | Scale == 0, W_DEFAULT, Scale),
+    name  = coalesce(name, "OBS NOT IN OBSCONST!")
+  )
+
+kbl(
+  obsconst |> select(Obs, name, k, Scale),
+  caption  = glue("Observer constants used for {monthyr_str}"),
+  digits   = 4,
+  booktabs = TRUE
+) |>
+  kable_styling(full_width = FALSE)
+```
+
+## Compute per-observation quantities
+
+```{r compute-obs}
+obs <- sun_data |>
+  left_join(obsconst |> select(Obs, k, Scale, name), by = "Obs") |>
+  mutate(
+    k      = coalesce(k,     K_DEFAULT),
+    Scale  = coalesce(Scale, W_DEFAULT),
+    name   = coalesce(name,  "OBS NOT IN OBSCONST!")
+  ) |>
+  rowwise() |>
+  mutate(JD = old_solarjd(day, params$month, params$year, UT)) |>
+  ungroup() |>
+  mutate(
+    kcount = round_half_up(W * k, 4L),
+    # Integer day bucket — matches Perl: int($jd + 0.50001)
+    lday   = floor(JD + 0.50001)
+  )
+
+# Warn about any observers not found in obsconst
+missing_obs <- obs |>
+  filter(name == "OBS NOT IN OBSCONST!") |>
+  distinct(Obs)
+
+if (nrow(missing_obs) > 0L) {
+  cat(sprintf(
+    "WARNING: k and Scale not found for observer(s): %s — defaults applied.\n",
+    paste(missing_obs$Obs, collapse = ", ")
+  ))
+}
+```
+
+## Compute daily statistics
+
+Daily raw mean (RAW) and weighted k-corrected mean (Ra) match the Perl
+`compdaily` subroutine output columns.
+
+```{r daily-stats}
+daily_stats <- obs |>
+  group_by(lday) |>
+  summarize(
+    numdat   = n(),
+    # Arithmetic mean of raw Wolf number (dave[1] in Perl)
+    raw_ave  = mean(W),
+    # Weighted arithmetic mean of k-corrected Wolf number (dave[2] in Perl)
+    kw_ave   = sum(Scale * kcount) / sum(Scale),
+    # Unweighted sample std dev of W (dsig[1] in Perl)
+    raw_sd   = if_else(n() > 1L, sd(W), 0),
+    # Weighted sample std dev of kcount (dsig[2] in Perl)
+    kw_var   = (sum(Scale * kcount^2) / sum(Scale)) - (sum(Scale * kcount) / sum(Scale))^2,
+    kw_dfact = 1 - sum(Scale^2) / sum(Scale)^2,
+    kw_sd    = if_else(n() > 1L, sqrt(replace_na(kw_var / kw_dfact, 0)), 0),
+    .groups  = "drop"
+  ) |>
+  mutate(
+    day_seq = row_number(),
+    # Round-half-up to integer — matches Perl int($dave[1]+0.5)
+    raw_rnd = as.integer(floor(raw_ave + 0.5)),
+    kw_rnd  = as.integer(floor(kw_ave  + 0.5))
+  ) |>
+  select(day_seq, numdat, raw_ave, raw_sd, raw_rnd, kw_ave, kw_sd, kw_rnd, lday)
+```
+
+### Daily summary table
+
+```{r daily-preview}
+#| tbl-cap: "Daily statistics — RAW = arithmetic mean of W; Ra = weighted mean of k-corrected W"
+
+daily_stats |>
+  select(
+    Day      = day_seq,
+    `N obs`  = numdat,
+    RAW      = raw_rnd,
+    `RAW sd` = raw_sd,
+    Ra       = kw_rnd,
+    `Ra sd`  = kw_sd
+  ) |>
+  kbl(booktabs = TRUE, digits = 2, linesep = "") |>
+  kable_styling(
+    latex_options = c("striped", "hold_position"),
+    full_width    = FALSE
+  )
+```
+
+## Observer tally
+
+```{r obs-tally}
+obs_tally <- obs |>
+  count(Obs, name = "n_obs") |>
+  left_join(obsconst |> select(Obs, name), by = "Obs") |>
+  mutate(name = coalesce(name, "OBS NOT IN OBSCONST!")) |>
+  arrange(Obs)
+
+kbl(
+  obs_tally,
+  col.names = c("Obs", "Observations", "Name"),
+  caption   = "Observation count by observer",
+  booktabs  = TRUE
+) |>
+  kable_styling(full_width = FALSE)
+```
+
+## Write `soldata.txt` {#sec-write}
+
+Output format matches the original Perl `printf` exactly.
+
+```{r write-txt}
+output_file <- file.path(params$output_dir, "soldata.txt")
+
+# Averages over all days
+n_days     <- nrow(daily_stats)
+ave_numobs <- mean(daily_stats$numdat)
+ave_raw    <- mean(daily_stats$raw_ave)
+ave_kw     <- mean(daily_stats$kw_ave)
+
+# --- body lines ---
+body_lines <- daily_stats |>
+  mutate(
+    line = sprintf("%2i   %4i   %4i   %4i", day_seq, numdat, raw_rnd, kw_rnd)
+  ) |>
+  pull(line)
+
+# --- footer lines ---
+average_line <- sprintf(
+  "Average  %6.1f   %6.1f   %6.1f",
+  ave_numobs, ave_raw, ave_kw
+)
+
+tally_lines <- c(
+  "Number of observations by observer:",
+  "===================================",
+  obs_tally |>
+    mutate(line = sprintf("%-4s  %4i   %s", Obs, n_obs, name)) |>
+    pull(line),
+  "===================================",
+  sprintf("No. of Observers: %3i",           n_distinct(obs$Obs)),
+  "===================================",
+  sprintf("Total No. of Observations: %4i",  n_data)
+)
+
+all_lines <- c(
+  "DAY    NumObs    RAW     Ra",
+  body_lines,
+  average_line,
+  tally_lines
+)
+
+writeLines(all_lines, output_file)
+cat(sprintf(
+  "Wrote %d day(s) + footer to: %s\n",
+  n_days, output_file
+))
+```
+
+```{r disconnect}
+dbDisconnect(dbh)
+cat("Database connection closed.\n")
+```

@@ -1,0 +1,274 @@
+---
+title: "AAVSO Solar Raw Processing"
+subtitle: "Tidyverse port of RAWPROC_DB.PL v1.0 — Matthew Templeton, AAVSO HQ (2012-06-13)"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    self-contained: true
+  pdf:
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  month: 5        # Integer 1–12
+  year:  2026     # Four-digit year ≥ 1940
+  output_dir: "."
+---
+
+```{r setup, include=FALSE}
+library(DBI)
+library(RMariaDB)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(glue)
+```
+
+```{r constants}
+K_DEFAULT <- 1.0   # fallback k-value when observer has none
+W_DEFAULT <- 0.1   # fallback Scale/weight
+
+months_lut  <- c("XXX","Jan","Feb","Mar","Apr","May","Jun",
+                 "Jul","Aug","Sep","Oct","Nov","Dec")
+
+stopifnot(params$month >= 1L, params$month <= 12L, params$year >= 1940L)
+
+monthyr_str <- paste0(months_lut[params$month], " ", params$year)
+```
+
+```{r connect}
+dbh <- dbConnect(
+  RMariaDB::MariaDB(),
+  dbname   = "aavso",
+  host     = "localhost",
+  user     = "root",
+  password = "dJj135790",
+  port     = 3333
+)
+```
+
+## Helper functions
+
+Ported directly from the Perl `old_solarjd` / `julian_zero` subroutines so
+that Julian Date values in `soldata.srt` are byte-for-byte identical to those
+produced by the original script.
+
+```{r jd-helpers}
+# Cumulative days before the start of each month (non-leap year, month 1..12).
+# Matches Perl's @nmon array accessed as $nmon[$month].
+.nmon <- c(0L, 31L, 59L, 90L, 120L, 151L, 181L, 212L, 243L, 273L, 304L, 334L)
+
+# Port of Perl julian_zero($month, $year)
+julian_zero <- function(month, year) {
+  nyr   <- as.integer(year)
+  if (nyr < 100L) nyr <- nyr + 2000L
+  nyr   <- nyr - 1601L
+  dtime <- 2305813L
+  while (nyr >= 400L) { nyr <- nyr - 400L; dtime <- dtime + 146097L }
+  while (nyr >= 100L) { nyr <- nyr - 100L; dtime <- dtime + 36524L  }
+  while (nyr >= 4L)   { nyr <- nyr - 4L;   dtime <- dtime + 1461L   }
+  dtime <- dtime + 365L * nyr + .nmon[month]
+  if (nyr == 3L && month > 2L) dtime <- dtime + 1L
+  dtime
+}
+
+# Port of Perl old_solarjd($day, $month, $year, $ut)
+# ut is a 4-character string "HHMM"; numeric values are zero-padded automatically.
+# Returns Modified Julian Date (MJD = JD - 2,400,000.5).
+old_solarjd <- function(day, month, year, ut) {
+  ut_str <- str_pad(as.character(ut), 4L, side = "left", pad = "0")
+  nhour  <- as.integer(substr(ut_str, 1L, 2L))
+  nmin   <- as.integer(substr(ut_str, 3L, 4L))
+  frac   <- ((60L * nhour) + nmin) / 1440.0
+  frac + day + julian_zero(month, year) - 2400000.5
+}
+
+# Round-half-up to `digits` decimal places.
+# Matches Perl: int(10000 * x + 0.5) / 10000
+round_half_up <- function(x, digits = 0L) {
+  floor(x * 10^digits + 0.5) / 10^digits
+}
+
+# Format a log value as a 6-character string matching Perl's output.
+# Returns "-.----" when the input is NA (i.e., count == 0).
+fmt_log <- function(x) {
+  if_else(
+    is.na(x),
+    "-.----",
+    formatC(x, format = "f", digits = 4L, width = 6L)
+  )
+}
+```
+
+## Fetch observations
+
+```{r fetch-obs}
+sun_data <- tbl(dbh, "sun_data") |>
+  filter(
+    monthyr == monthyr_str,
+    revised == 0L,
+    !Obs %in% c("BSJ1", "TMT", "WEO", "SSTW", "ARUB")
+  ) |>
+  collect() |>
+  arrange(Obs, day, UT)
+
+publish_uids <- sun_data$uid   # save before any joins
+
+n_data      <- nrow(sun_data)
+n_observers <- n_distinct(sun_data$Obs)
+
+cat(sprintf("There were %d observations by %d observers.\n", n_data, n_observers))
+
+if (n_data == 0L) {
+  cat("No data found for", monthyr_str, "— nothing to do.\n")
+  dbDisconnect(dbh)
+  knitr::knit_exit()
+}
+```
+
+## Fetch observer constants
+
+```{r fetch-obsconst}
+olist <- unique(sun_data$Obs)
+
+obsconst <- tbl(dbh, "sun_obsconst") |>
+  filter(Obs %in% olist) |>
+  collect() |>
+  select(Obs, k, Scale, name, updated) |>
+  arrange(Obs, desc(updated)) |>
+  slice_max(updated, by = Obs, n = 1L, with_ties = FALSE) |>
+  mutate(
+    k     = if_else(is.na(k)     | k     == 0, K_DEFAULT, k),
+    Scale = if_else(is.na(Scale) | Scale == 0, W_DEFAULT, Scale),
+    name  = str_sub(coalesce(name, "OBS NOT IN OBSCONST!"), 1L, 20L)
+  )
+
+kbl(
+  obsconst |> select(Obs, name, k, Scale),
+  caption  = glue("Observer constants used for {monthyr_str}"),
+  digits   = 4,
+  booktabs = TRUE
+) |>
+  kable_styling(full_width = FALSE)
+```
+
+## Compute derived quantities {#sec-compute}
+
+```{r compute}
+results <- sun_data |>
+  left_join(obsconst |> select(Obs, k, Scale, name), by = "Obs") |>
+  mutate(
+    k     = coalesce(k,     K_DEFAULT),
+    Scale = coalesce(Scale, W_DEFAULT),
+    name  = str_sub(coalesce(name, "OBS NOT IN OBSCONST!"), 1L, 20L)
+  ) |>
+  rowwise() |>
+  mutate(JD = old_solarjd(day, params$month, params$year, UT)) |>
+  ungroup() |>
+  mutate(
+    count      = s + 10L * g,
+    W_match    = (count == W),
+
+    # k-corrected Wolf number — round-half-up to match Perl
+    kcount     = round_half_up(count * k, 4L),
+
+    # Log10 values; NA sentinel when count == 0
+    logcount   = if_else(count  > 0, round_half_up(log10(count),  4L), NA_real_),
+    logkcount  = if_else(kcount > 0, round_half_up(log10(kcount), 4L), NA_real_),
+
+    # 6-character string fields used in the printf output
+    lc_str     = fmt_log(logcount),
+    lk_str     = fmt_log(logkcount)
+  ) |>
+  arrange(JD)
+```
+
+### Wolf number mismatch check
+
+```{r mismatch}
+mismatches <- filter(results, !W_match)
+n_mm <- nrow(mismatches)
+
+if (n_mm > 0L) {
+  cat(sprintf("WARNING: %d observation(s) where submitted W != s + 10*g:\n", n_mm))
+  kbl(
+    mismatches |> select(uid, Obs, day, g, s, W, count),
+    booktabs = TRUE
+  ) |>
+    kable_styling(full_width = FALSE) |>
+    print()
+} else {
+  cat("All W values match s + 10*g. No mismatches found.\n")
+}
+```
+
+### Preview
+
+```{r preview}
+#| tbl-cap: "First 10 rows of computed results (sorted by MJD)"
+
+results |>
+  slice_head(n = 10L) |>
+  select(JD, Obs, name, day, g, s, W, k, kcount, lc_str, lk_str, Scale, see) |>
+  kbl(booktabs = TRUE, digits = 4, linesep = "") |>
+  kable_styling(
+    latex_options = c("striped", "hold_position", "scale_down"),
+    full_width    = FALSE
+  )
+```
+
+## Write `soldata.srt` {#sec-write}
+
+Output format matches the original Perl `printf` exactly so downstream
+tools that consume `soldata.srt` are unaffected.
+
+```{r write-srt}
+output_file <- file.path(params$output_dir, "soldata.srt")
+
+header_line <- "   JD         g    s   c     kc   log(c) log(kc)  w   Obs.      Obs. Name"
+
+lines <- results |>
+  mutate(
+    line = sprintf(
+      "%10.4f %4i %4i %4i %7.2f %6s %6s %5.3f %-4s %-20s   | %s",
+      JD,
+      as.integer(g),
+      as.integer(s),
+      as.integer(W),
+      kcount,
+      lc_str,
+      lk_str,
+      Scale,
+      Obs,
+      name,
+      see
+    )
+  ) |>
+  pull(line)
+
+writeLines(c(header_line, lines), output_file)
+cat(sprintf("Wrote %d data line(s) to: %s\n", length(lines), output_file))
+```
+
+## Mark observations as published
+
+```{r mark-published}
+cat("Updating sun_data to mark observations as published.... please wait.\n")
+
+walk(
+  publish_uids,
+  ~ dbExecute(dbh, "UPDATE sun_data SET published = 1 WHERE uid = ?", params = list(.x))
+)
+
+cat(sprintf("Marked %d observation(s) as published.\n", length(publish_uids)))
+```
+
+```{r disconnect}
+dbDisconnect(dbh)
+cat("Database connection closed.\n")
+```
